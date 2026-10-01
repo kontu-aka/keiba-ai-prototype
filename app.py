@@ -35,16 +35,63 @@ st.warning(
 )
 
 
+# v0.2のmetrics.jsonが持つべき必須キー。train/valid/testの3分割と、
+# 回収率・較正指標（betting/calibration）がこれに含まれる。
+# 旧v0.1形式のmetrics.json（train/test 2分割、betting/calibrationなし）は
+# ここで不正と判定し、v0.2形式として再生成する。
+REQUIRED_METRICS_KEYS = {
+    "valid_start",
+    "valid_end",
+    "train_start",
+    "train_end",
+    "test_start",
+    "test_end",
+    "train_races",
+    "valid_races",
+    "test_races",
+    "betting",
+    "calibration",
+}
+
+
+def _is_valid_v0_2_metrics(metrics_data: object) -> bool:
+    """ファイルが存在するだけでなく、v0.2形式として必要なキーを持つかを確認する。"""
+    if not isinstance(metrics_data, dict):
+        return False
+    if not REQUIRED_METRICS_KEYS.issubset(metrics_data.keys()):
+        return False
+    betting = metrics_data.get("betting")
+    if not isinstance(betting, dict) or "ai_top_pick" not in betting or "favorite" not in betting:
+        return False
+    if not isinstance(metrics_data.get("calibration"), dict):
+        return False
+    return True
+
+
 def ensure_demo_artifacts() -> None:
-    """ローカル生成物がない公開環境では、架空CSVから初回だけ自動生成する。"""
+    """ローカル生成物がない、またはv0.2形式でない場合は、架空CSVから学習し直す。
+
+    metrics.jsonが存在するだけでは「有効なartifact」とは判定しない。
+    旧v0.1形式（train/test 2分割、betting/calibrationなし）が残っている場合も、
+    KeyErrorにせずv0.2形式として再生成する。
+    """
+    artifacts_valid = False
     if METRICS_PATH.exists() and PREDICTIONS_PATH.exists():
+        try:
+            with METRICS_PATH.open(encoding="utf-8") as file:
+                existing_metrics = json.load(file)
+            artifacts_valid = _is_valid_v0_2_metrics(existing_metrics)
+        except (OSError, json.JSONDecodeError):
+            artifacts_valid = False
+
+    if artifacts_valid:
         return
 
     if not DATA_PATH.exists():
         st.error("公開デモ用のサンプルデータが見つかりません。")
         st.stop()
 
-    with st.spinner("初回起動のため、デモ用AIモデルを準備しています…"):
+    with st.spinner("初回起動、またはartifact形式更新のため、デモ用AIモデルを準備しています…"):
         try:
             train_and_evaluate(DATA_PATH, ARTIFACT_DIR)
         except Exception:
@@ -79,9 +126,32 @@ race_summary = (
     .drop_duplicates()
     .sort_values(["race_date", "race_id"])
 )
+
+min_race_date = race_summary["race_date"].min().date()
+max_race_date = race_summary["race_date"].max().date()
+
+date_range = st.date_input(
+    "日付で絞り込む（testレースのみ表示）",
+    value=(min_race_date, max_race_date),
+    min_value=min_race_date,
+    max_value=max_race_date,
+)
+if isinstance(date_range, tuple) and len(date_range) == 2:
+    range_start, range_end = date_range
+else:
+    range_start, range_end = min_race_date, max_race_date
+
+filtered_race_summary = race_summary.loc[
+    (race_summary["race_date"].dt.date >= range_start)
+    & (race_summary["race_date"].dt.date <= range_end)
+]
+if filtered_race_summary.empty:
+    st.warning("選択した日付範囲にレースがありません。日付範囲を見直してください。")
+    st.stop()
+
 race_labels = {
     row.race_id: f"{row.race_date:%Y-%m-%d} / {row.race_id}"
-    for row in race_summary.itertuples(index=False)
+    for row in filtered_race_summary.itertuples(index=False)
 }
 
 selected_race = st.selectbox(
@@ -194,7 +264,11 @@ with st.expander("モデルの詳しい評価を見る"):
     )
     st.write(
         f"**train期間:** {metrics['train_start']} ～ {metrics['train_end']}　　"
+        f"**valid期間:** {metrics['valid_start']} ～ {metrics['valid_end']}　　"
         f"**test期間:** {metrics['test_start']} ～ {metrics['test_end']}"
+    )
+    st.caption(
+        "validはモデル設定の選択にのみ使用し、testはモデル調整に使用していません。"
     )
 
     metric_columns = st.columns(4)
@@ -216,6 +290,64 @@ with st.expander("モデルの詳しい評価を見る"):
     )
     st.caption(
         f"test出走馬数: {int(metrics['test_rows']):,}行"
+    )
+
+
+with st.expander("購入シミュレーションと確率較正の詳細を見る（架空データ）"):
+    st.warning(
+        "これは架空データ上の購入シミュレーションです。"
+        "実競馬での収益性や的中を示すものではなく、購入を推奨するものでもありません。"
+    )
+
+    ai_betting = metrics["betting"]["ai_top_pick"]
+    favorite_betting = metrics["betting"]["favorite"]
+    calibration = metrics["calibration"]
+
+    st.write("**単勝100円を毎レース購入したと仮定した場合（test全体）**")
+    sim_columns = st.columns(2)
+    with sim_columns[0]:
+        st.markdown("**AI予想1位**")
+        st.metric("的中率", f"{ai_betting['hit_rate']:.1%}")
+        ai_ci_low, ai_ci_high = ai_betting["recovery_rate_ci95"]
+        st.metric(
+            "回収率（95%信頼区間）",
+            f"{ai_betting['recovery_rate']:.1%}",
+            help=f"bootstrap 95%CI: {ai_ci_low:.1%} ～ {ai_ci_high:.1%}",
+        )
+        st.caption(f"95%CI: {ai_ci_low:.1%} ～ {ai_ci_high:.1%}")
+    with sim_columns[1]:
+        st.markdown("**1番人気**")
+        st.metric("的中率", f"{favorite_betting['hit_rate']:.1%}")
+        fav_ci_low, fav_ci_high = favorite_betting["recovery_rate_ci95"]
+        st.metric(
+            "回収率（95%信頼区間）",
+            f"{favorite_betting['recovery_rate']:.1%}",
+            help=f"bootstrap 95%CI: {fav_ci_low:.1%} ～ {fav_ci_high:.1%}",
+        )
+        st.caption(f"95%CI: {fav_ci_low:.1%} ～ {fav_ci_high:.1%}")
+
+    st.caption(
+        f"信頼区間はレース単位のbootstrap（{ai_betting['bootstrap_iterations']:,}回、"
+        f"固定seed）による95%区間です。"
+    )
+
+    st.write("**AI予想1位の確率較正状態（test全体）**")
+    calibration_columns = st.columns(3)
+    calibration_columns[0].metric(
+        "表示勝率の平均",
+        f"{calibration['avg_predicted_probability']:.1%}",
+    )
+    calibration_columns[1].metric(
+        "実際の勝率",
+        f"{calibration['actual_win_rate']:.1%}",
+    )
+    calibration_columns[2].metric(
+        "差（表示 − 実際）",
+        f"{calibration['difference']:+.1%}",
+    )
+    st.caption(
+        "差がゼロに近いほど、表示している勝率と実際の勝率が近いことを意味します。"
+        "この差はモデルの精度そのものではなく、較正（キャリブレーション）状態の目安です。"
     )
 
 
@@ -276,7 +408,10 @@ with st.expander("設計上の注意"):
         "race_id単位で合計100%に正規化した表示用の暫定値です。\n"
         "- `finish_position` と `target_win` は評価専用で、"
         "モデル特徴量には使用していません。\n"
-        "- 古い日付をtrain、新しい日付をtestにした時系列分割です。\n"
+        "- `horse_number` は架空データ上で結果と意味のある関係を持たないため、"
+        "特徴量から除外しています。\n"
+        "- 古い日付から新しい日付の順に train → valid → test と時系列3分割し、"
+        "testはモデル調整に使用していません。\n"
         "- 予想時点オッズは結果確定前に利用可能な入力としてモデルにも使用しています。\n"
         "- JRA-VAN / JV-Link、スクレイピング、馬券購入には接続していません。"
     )

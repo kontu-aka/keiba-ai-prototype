@@ -26,13 +26,18 @@ def _softmax(values: np.ndarray) -> np.ndarray:
 
 def generate_sample_data(
     seed: int = DEFAULT_SEED,
-    number_of_dates: int = 64,
+    number_of_dates: int = 640,
     races_per_date: int = 3,
 ) -> pd.DataFrame:
-    """固定seedで、予想時点特徴量とレース結果を持つ架空データを返す。"""
+    """固定seedで、予想時点特徴量とレース結果を持つ架空データを返す。
+
+    number_of_dates / races_per_date はv0.1比でおよそ10倍のレース数を生成する。
+    実競馬のデータ量を再現する意図ではなく、架空データ上で評価値のばらつきを
+    減らし、評価パイプラインを検証するための規模拡大。
+    """
     rng = np.random.default_rng(seed)
-    horse_count = 180
-    jockey_count = 32
+    horse_count = 360
+    jockey_count = 64
 
     horse_profiles = {
         f"H{index:03d}": {
@@ -53,7 +58,9 @@ def generate_sample_data(
     horse_last_date: dict[str, pd.Timestamp] = {}
     jockey_results: dict[int, list[int]] = defaultdict(list)
 
-    start_date = pd.Timestamp("2024-01-06")
+    # レース数10倍化後もnumber_of_dates=640で最終日が現在日付より未来にならないよう、
+    # v0.1の開始日(2024-01-06)より前倒しした固定日付。
+    start_date = pd.Timestamp("2021-05-02")
     race_dates = [start_date + pd.Timedelta(days=3 * offset) for offset in range(number_of_dates)]
     rows: list[dict[str, object]] = []
 
